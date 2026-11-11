@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.local/
+test-results/
+playwright-report/
+*.log
+*.tsbuildinfo
+tests/history-validation.json
+scripts/build-local-history.py
