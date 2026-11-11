@@ -43,4 +43,4 @@ npm run test:browser
 npm run build:pages
 ```
 
-GitHub Pages 从 `main` 分支的 `docs/` 目录发布；静态资源已适配 `/Daily/` 子路径。更新代码后重新构建 `docs/` 并提交。测试使用明确的虚构数据，不依赖真实个人账单。
+GitHub Pages 从 `gh-pages` 分支的根目录发布，`main` 保存源码和 `docs/` 构建产物。静态资源已适配 `/Daily/` 子路径。更新程序后重新构建，并将 `docs/` 内容同步到 `gh-pages` 分支。每月账单通过网页导入即可，无需修改代码或重新发布。测试使用明确的虚构数据，不依赖真实个人账单。
