@@ -62,24 +62,24 @@ import {
   removeBatchTransactions,
 } from "./lib/editor";
 
-type Batch = {
-  id: string;
-  name: string;
-  date: string;
-  count: number;
-  duplicates: number;
-  transactionIds: string[];
-};
-type State = {
-  version: 1;
-  categories: Category[];
-  settings: Settings;
-  transactions: Transaction[];
-  batches: Batch[];
-  funds: Record<string, number>;
-  saved: Record<string, number>;
-  metadata?: { latestDate?: string; [key: string]: unknown };
-};
+import { fetchVault, parseVaultKey } from "./lib/vault";
+import {
+  parseSnapshot,
+  snapshotFingerprint,
+  type BudgetSnapshot,
+} from "./lib/snapshot";
+type State = BudgetSnapshot;
+// A fragment is never sent in HTTP requests. Remove it before any vault fetch.
+const entryHash = window.location.hash;
+const initialVaultKey = parseVaultKey(entryHash);
+const invalidVaultEntry = entryHash.startsWith("#vault=") && !initialVaultKey;
+if (entryHash.startsWith("#vault=")) {
+  window.history.replaceState(
+    window.history.state,
+    "",
+    window.location.pathname + window.location.search,
+  );
+}
 const STORAGE = "daily-budget-v1";
 function historyRangeLabel(metadata: State["metadata"]) {
   const range = (key: string) => {
@@ -246,7 +246,9 @@ function Modal({
 
 export default function App() {
   const [state, setState] = useState<State>(() => readState() || emptyState());
-  const [ready, setReady] = useState(!!readState() || !import.meta.env.DEV);
+  const [ready, setReady] = useState(
+    !!readState() || !import.meta.env.DEV || entryHash.startsWith("#vault="),
+  );
   const [page, setPage] = useState<Page>("overview");
   const [period, setPeriod] = useState<"quarter" | "year">("quarter");
   const [filter, setFilter] = useState("all");
@@ -279,6 +281,44 @@ export default function App() {
   );
   const fileRef = useRef<HTMLInputElement>(null);
   const backupRef = useRef<HTMLInputElement>(null);
+  const [vaultKey, setVaultKey] = useState<string | null>(initialVaultKey);
+  const [vaultBusy, setVaultBusy] = useState(!!initialVaultKey);
+  const [vaultError, setVaultError] = useState(
+    invalidVaultEntry ? "专属入口不完整，请重新打开完整链接。" : "",
+  );
+  const [unlockOpen, setUnlockOpen] = useState(false);
+  const [unlockInput, setUnlockInput] = useState("");
+  const [vaultIncoming, setVaultIncoming] = useState<{
+    snapshot: State;
+    fingerprint: string;
+  } | null>(null);
+  const vaultFlight = useRef<{ key: string; promise: Promise<unknown> } | null>(
+    null,
+  );
+  const installSnapshot = (snapshot: State, fingerprint: string) => {
+    const next: State = {
+      ...snapshot,
+      settings: { ...snapshot.settings, asOf: defaultSettings.asOf },
+      metadata: {
+        ...snapshot.metadata,
+        privateSnapshotId: fingerprint,
+        privateLoadedAt: new Date().toISOString(),
+      },
+    };
+    // Persist before reporting success; do not replace an existing book on a failed write.
+    localStorage.setItem(STORAGE, JSON.stringify(next));
+    setState(next);
+    setDraftCategories(next.categories);
+    setDraftSettings(next.settings);
+    setSaveAmount(String(next.settings.savingsGoal));
+    setReady(true);
+    setVaultIncoming(null);
+    setUnlockOpen(false);
+    setUnlockInput("");
+    setVaultError("");
+    notify("已载入已核对账单和个人预算");
+  };
+
   const notify = (s: string) => {
     setToast(s);
   };
@@ -288,6 +328,86 @@ export default function App() {
       return () => clearTimeout(t);
     }
   }, [toast]);
+  useEffect(() => {
+    const receivePrivateEntry = () => {
+      const hash = window.location.hash;
+      if (!hash.startsWith("#vault=")) return;
+      const key = parseVaultKey(hash);
+      window.history.replaceState(
+        window.history.state,
+        "",
+        window.location.pathname + window.location.search,
+      );
+      if (key) {
+        setVaultError("");
+        setVaultKey(key);
+      } else {
+        setVaultError("专属入口不完整，请重新打开完整链接。");
+      }
+    };
+    window.addEventListener("hashchange", receivePrivateEntry);
+    return () => window.removeEventListener("hashchange", receivePrivateEntry);
+  }, []);
+  useEffect(() => {
+    if (!vaultKey) return;
+    let cancelled = false;
+    setVaultBusy(true);
+    setVaultError("");
+    if (vaultFlight.current?.key !== vaultKey) {
+      vaultFlight.current = {
+        key: vaultKey,
+        promise: fetchVault(vaultKey, {
+          url: `${import.meta.env.BASE_URL}private-vault.json`,
+        }),
+      };
+    }
+    const flight = vaultFlight.current;
+    flight.promise
+      .then(async (value) => {
+        const snapshot = parseSnapshot(value);
+        const fingerprint = await snapshotFingerprint(snapshot);
+        if (cancelled) return;
+        const existing = readState();
+        if (existing?.metadata?.privateSnapshotId === fingerprint) {
+          setState(existing);
+          setReady(true);
+          setUnlockOpen(false);
+          setUnlockInput("");
+          notify("已使用本机账本，后续新增记录和修改已保留");
+        } else if (
+          existing &&
+          (existing.transactions.length > 0 ||
+            existing.categories.some((c) => c.annual > 0) ||
+            Object.values(existing.saved || {}).some((v) => v > 0) ||
+            Object.values(existing.funds || {}).some((v) => v > 0))
+        ) {
+          setVaultIncoming({ snapshot, fingerprint });
+          setUnlockOpen(false);
+          setUnlockInput("");
+        } else {
+          installSnapshot(snapshot, fingerprint);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled)
+          setVaultError(
+            error instanceof Error
+              ? error.message
+              : "无法载入私密账本，请稍后重试。",
+          );
+      })
+      .finally(() => {
+        if (!cancelled) {
+          vaultFlight.current = null;
+          setVaultKey(null);
+          setVaultBusy(false);
+          setReady(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [vaultKey]);
   useEffect(() => {
     if (ready || !import.meta.env.DEV) return;
     let cancelled = false;
@@ -522,41 +642,7 @@ export default function App() {
     );
   const restore = async (file: File) => {
     try {
-      const v = JSON.parse(await file.text());
-      const valid =
-        v.version === 1 &&
-        Array.isArray(v.transactions) &&
-        v.transactions.length < 100000 &&
-        Array.isArray(v.categories) &&
-        v.categories.length === 15 &&
-        v.categories.every(
-          (c: Category) =>
-            defaultCategories.some((d) => d.id === c.id) &&
-            [c.annual, c.monthly, c.bonus].every(
-              (n) => Number.isFinite(n) && n >= 0,
-            ),
-        ) &&
-        new Set(v.categories.map((c: Category) => c.id)).size === 15 &&
-        v.transactions.every(
-          (t: Transaction) =>
-            typeof t.id === "string" &&
-            /^\d{4}-\d{2}-\d{2}$/.test(t.date) &&
-            typeof t.merchant === "string" &&
-            typeof t.description === "string" &&
-            Number.isSafeInteger(t.amount) &&
-            ["expense", "refund", "income", "transfer", "repayment"].includes(
-              t.kind,
-            ),
-        ) &&
-        v.settings &&
-        /^\d{4}-\d{2}$/.test(v.settings.startMonth) &&
-        /^\d{4}-\d{2}-\d{2}$/.test(v.settings.asOf) &&
-        [
-          v.settings.monthlyIncome,
-          v.settings.savingsGoal,
-          v.settings.installments,
-        ].every((n) => Number.isFinite(n) && n >= 0);
-      if (!valid) throw Error("文件不是有效的留白预算备份。");
+      const v = parseSnapshot(JSON.parse(await file.text()));
       if (
         !window.confirm(
           "恢复备份将替换当前浏览器中的账单和预算。建议先导出当前备份。继续恢复？",
@@ -688,6 +774,39 @@ export default function App() {
                 导入新账单
               </button>
             </section>
+            {vaultBusy && (
+              <div className="vault-status" role="status">
+                <LoaderCircle size={18} className="spin" />
+                <div>
+                  <strong>正在载入你的已核对账本…</strong>
+                  <span>完成后自动更新预算余额。</span>
+                </div>
+              </div>
+            )}
+            {vaultError && (
+              <div className="alert error" role="alert">
+                <AlertCircle size={18} />
+                <span>{vaultError}</span>
+                <button
+                  className="text-button"
+                  onClick={() => setUnlockOpen(true)}
+                >
+                  重新解锁
+                </button>
+              </div>
+            )}
+            {state.metadata?.privateSnapshotId && (
+              <div className="vault-status loaded">
+                <ShieldCheck size={18} />
+                <div>
+                  <strong>已载入你的财务分析数据</strong>
+                  <span>
+                    账单覆盖至 {String(state.metadata.latestDate || "待核对")} ·
+                    后续导入保存在本机。
+                  </span>
+                </div>
+              </div>
+            )}
             {state.categories.every((c) => c.annual === 0) && (
               <section className="setup-card">
                 <div>
@@ -1360,6 +1479,13 @@ export default function App() {
                     账本保存在当前浏览器。换手机、换浏览器前，记得导出备份。
                   </p>
                 </div>
+                <button
+                  className="button outline full-width"
+                  onClick={() => setUnlockOpen(true)}
+                >
+                  <ShieldCheck size={16} />
+                  解锁已整理账本
+                </button>
                 <button className="button outline full-width" onClick={backup}>
                   <ArrowDownToLine size={16} />
                   导出完整备份
@@ -1955,13 +2081,126 @@ export default function App() {
             </p>
             <h3>数据保存在当前设备</h3>
             <p>
-              导入文件仅在浏览器解析。数据保存在本机浏览器，不自动跨设备同步；清除浏览器数据会移除账本。请定期导出备份，在手机上恢复即可继续使用。
+              导入文件仅在浏览器解析。数据保存在本机浏览器，不自动跨设备同步；专属入口可解锁已整理的加密快照，本机后来新增的记录仍需备份迁移。清除浏览器数据会移除本机账本。请定期导出备份，在手机上恢复即可继续使用。
             </p>
           </div>
           <button className="button dark full-width" onClick={backup}>
             <Download size={17} />
             导出完整备份
           </button>
+        </Modal>
+      )}
+      {unlockOpen && (
+        <Modal
+          title="打开你的私密账本。"
+          subtitle="粘贴专属入口或解锁密钥，仅在当前浏览器解密。"
+          onClose={() => {
+            if (!vaultBusy) {
+              setUnlockOpen(false);
+              setUnlockInput("");
+            }
+          }}
+        >
+          <label className="form-label">
+            专属入口 / 解锁密钥
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={unlockInput}
+              onChange={(e) => setUnlockInput(e.target.value)}
+              placeholder="粘贴完整专属链接或密钥"
+            />
+          </label>
+          {vaultError && (
+            <p className="danger-text small" role="alert">
+              {vaultError}
+            </p>
+          )}
+          <p className="footnote">
+            公开网页保存的是加密快照。密钥不会上传；加载后账本保存在本机浏览器。
+          </p>
+          <button
+            className="button dark full-width"
+            disabled={vaultBusy || !unlockInput.trim()}
+            onClick={() => {
+              const input = unlockInput.trim();
+              let hash = input.startsWith("#") ? input : `#vault=${input}`;
+              try {
+                if (/^https?:\/\//.test(input)) hash = new URL(input).hash;
+              } catch {
+                setVaultError("专属入口格式无效，请粘贴完整链接。");
+                return;
+              }
+              const key = parseVaultKey(hash);
+              if (!key) {
+                setVaultError("密钥格式不正确，请使用完整的专属入口。");
+                return;
+              }
+              setVaultError("");
+              setUnlockInput("");
+              setVaultKey(key);
+            }}
+          >
+            {vaultBusy ? (
+              <LoaderCircle className="spin" size={17} />
+            ) : (
+              <ShieldCheck size={17} />
+            )}
+            解锁并载入
+          </button>
+        </Modal>
+      )}
+      {vaultIncoming && (
+        <Modal
+          title="本机已经有一本生活账。"
+          subtitle="为保留你后来导入或修改的记录，本次尚未替换当前账本。"
+          onClose={() => setVaultIncoming(null)}
+        >
+          <div className="detail-totals">
+            <div>
+              <span>当前本机记录</span>
+              <strong>{state.transactions.length.toLocaleString()} 笔</strong>
+            </div>
+            <div>
+              <span>已整理快照记录</span>
+              <strong>
+                {vaultIncoming.snapshot.transactions.length.toLocaleString()} 笔
+              </strong>
+            </div>
+          </div>
+          <p className="footnote">
+            选择载入时，将先下载本机账本备份，再替换为已核对版本，避免把原单与净额重复合并。
+          </p>
+          <div className="modal-actions">
+            <button
+              className="button outline"
+              onClick={() => {
+                setVaultIncoming(null);
+                notify("已保留本机账本");
+              }}
+            >
+              保留本机账本
+            </button>
+            <button
+              className="button dark"
+              onClick={() => {
+                backup();
+                try {
+                  installSnapshot(
+                    vaultIncoming.snapshot,
+                    vaultIncoming.fingerprint,
+                  );
+                } catch {
+                  setVaultError(
+                    "浏览器存储失败，本机账本未替换，请先导出备份后重试。",
+                  );
+                }
+              }}
+            >
+              备份并载入已整理版本
+            </button>
+          </div>
         </Modal>
       )}
       {modal === "saving" && (
